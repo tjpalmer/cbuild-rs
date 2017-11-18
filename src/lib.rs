@@ -114,8 +114,20 @@ pub struct Build {
     static_crt: Option<bool>,
     shared_flag: Option<bool>,
     static_flag: Option<bool>,
+    kind: BuildKind,
     warnings_into_errors: bool,
     warnings: bool,
+}
+
+/// Represents the kind of output to produce.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BuildKind {
+    /// Executable (AKA binary) file.
+    Executable,
+    /// Shared (AKA dynamic) library.
+    Shared,
+    /// Static library.
+    Static,
 }
 
 /// Represents the types of errors that may occur while using cc-rs.
@@ -251,6 +263,7 @@ impl Build {
             files: Vec::new(),
             shared_flag: None,
             static_flag: None,
+            kind: BuildKind::Static,
             cpp: false,
             cpp_link_stdlib: None,
             cpp_set_stdlib: None,
@@ -425,6 +438,12 @@ impl Build {
     /// ```
     pub fn static_flag(&mut self, static_flag: bool) -> &mut Build {
         self.static_flag = Some(static_flag);
+        self
+    }
+
+    /// Set the build output kind.
+    pub fn kind(&mut self, kind: BuildKind) -> &mut Build {
+        self.kind = kind;
         self
     }
 
@@ -718,14 +737,30 @@ impl Build {
     ///
     /// This will return a result instead of panicing; see compile() for the complete description.
     pub fn try_compile(&self, output: &str) -> Result<(), Error> {
-        let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
-            (&output[3..output.len() - 2], output.to_owned())
-        } else {
-            let mut gnu = String::with_capacity(5 + output.len());
-            gnu.push_str("lib");
-            gnu.push_str(&output);
-            gnu.push_str(".a");
-            (output, gnu)
+        let msvc = self.get_target()?.contains("msvc");
+        let (lib_name, gnu_lib_name) = match self.kind {
+            BuildKind::Static => {
+                if output.starts_with("lib") && output.ends_with(".a") {
+                    (&output[3..output.len() - 2], output.to_owned())
+                } else {
+                    let mut gnu = String::with_capacity(5 + output.len());
+                    gnu.push_str("lib");
+                    gnu.push_str(&output);
+                    gnu.push_str(".a");
+                    (output, gnu)
+                }
+            }
+            _ => {
+                if msvc {
+                    let mut exe = String::with_capacity(4 + output.len());
+                    exe.push_str(&output);
+                    exe.push_str(".exe");
+                    (output, exe)
+                } else {
+                    // TODO What here?
+                    (output, output.to_owned())
+                }
+            },
         };
         let dst = self.get_out_dir()?;
 
@@ -757,7 +792,7 @@ impl Build {
         self.compile_objects(&src_dst)?;
         self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
 
-        if self.get_target()?.contains("msvc") {
+        if msvc {
             let compiler = self.get_base_compiler()?;
             let atlmfc_lib = compiler
                 .env()
@@ -1226,12 +1261,23 @@ impl Build {
 
         let target = self.get_target()?;
         if target.contains("msvc") {
+            let tool = match self.kind {
+                BuildKind::Executable => "link.exe",
+                BuildKind::Shared => {
+                    // TODO Use link.exe with /DLL.
+                    return Err(Error::new(
+                        ErrorKind::ToolExecError,
+                        "Shared library not implemented yet.",
+                    ));
+                }
+                BuildKind::Static => "lib.exe",
+            };
             let mut cmd = match self.archiver {
                 Some(ref s) => self.cmd(s),
                 None => {
-                    windows_registry::find(&target, "lib.exe").unwrap_or_else(
+                    windows_registry::find(&target, tool).unwrap_or_else(
                         || {
-                            self.cmd("lib.exe")
+                            self.cmd(tool)
                         },
                     )
                 }
@@ -1242,27 +1288,36 @@ impl Build {
                 cmd.arg(out).arg("/nologo").args(objects).args(
                     &self.objects,
                 ),
-                "lib.exe",
+                tool,
             )?;
 
-            // The Rust compiler will look for libfoo.a and foo.lib, but the
-            // MSVC linker will also be passed foo.lib, so be sure that both
-            // exist for now.
-            let lib_dst = dst.with_file_name(format!("{}.lib", lib_name));
-            let _ = fs::remove_file(&lib_dst);
-            match fs::hard_link(&dst, &lib_dst).or_else(|_| {
-                // if hard-link fails, just copy (ignoring the number of bytes written)
-                fs::copy(&dst, &lib_dst).map(|_| ())
-            }) {
-                Ok(_) => (),
-                Err(_) => {
-                    return Err(Error::new(
-                        ErrorKind::IOError,
-                        "Could not copy or create a hard-link to the generated lib file.",
-                    ))
-                }
-            };
+            // TODO This should an outer layer unrelated to core compiling.
+            if self.kind == BuildKind::Static {
+                // The Rust compiler will look for libfoo.a and foo.lib, but the
+                // MSVC linker will also be passed foo.lib, so be sure that both
+                // exist for now.
+                let lib_dst = dst.with_file_name(format!("{}.lib", lib_name));
+                let _ = fs::remove_file(&lib_dst);
+                match fs::hard_link(&dst, &lib_dst).or_else(|_| {
+                    // if hard-link fails, just copy (ignoring the number of bytes written)
+                    fs::copy(&dst, &lib_dst).map(|_| ())
+                }) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        return Err(Error::new(
+                            ErrorKind::IOError,
+                            "Could not copy or create a hard-link to the generated lib file.",
+                        ))
+                    }
+                };
+            }
         } else {
+            if self.kind != BuildKind::Static {
+                return Err(Error::new(
+                    ErrorKind::ToolExecError,
+                    "Only static lib implemented for now.",
+                ));
+            }
             let (mut ar, cmd) = self.get_ar()?;
             run(
                 ar.arg("crs").arg(dst).args(objects).args(&self.objects),
