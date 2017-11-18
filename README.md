@@ -1,5 +1,13 @@
 # cc-rs
 
+Forked from alexcrichton/cc-rs to generalize c compilation for my needs.
+It's a great base to work from.
+
+Original README follows.
+To be updated when I get to it.
+
+## Original README
+
 A library to compile C/C++/assembly into a Rust library/application.
 
 [![Build Status](https://travis-ci.org/alexcrichton/cc-rs.svg?branch=master)](https://travis-ci.org/alexcrichton/cc-rs)
