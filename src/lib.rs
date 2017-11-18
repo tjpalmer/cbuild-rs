@@ -115,6 +115,7 @@ pub struct Build {
     shared_flag: Option<bool>,
     static_flag: Option<bool>,
     kind: BuildKind,
+    verbose: bool,
     warnings_into_errors: bool,
     warnings: bool,
 }
@@ -275,9 +276,10 @@ impl Build {
             env: Vec::new(),
             compiler: None,
             archiver: None,
-            cargo_metadata: true,
+            cargo_metadata: false,
             pic: None,
             static_crt: None,
+            verbose: false,
             warnings: true,
             warnings_into_errors: false,
         }
@@ -721,6 +723,12 @@ impl Build {
         self
     }
 
+    /// Set verbose build output.
+    pub fn verbose(&mut self, verbose: bool) -> &mut Build {
+        self.verbose = verbose;
+        self
+    }
+
     #[doc(hidden)]
     pub fn __set_env<A, B>(&mut self, a: A, b: B) -> &mut Build
     where
@@ -910,7 +918,7 @@ impl Build {
         cmd.arg(if msvc { "/c" } else { "-c" });
         cmd.arg(file);
 
-        run(&mut cmd, &name)?;
+        self.run(&mut cmd, &name)?;
         Ok(())
     }
 
@@ -941,7 +949,7 @@ impl Build {
             .to_string_lossy()
             .into_owned();
 
-        Ok(run_output(&mut cmd, &name)?)
+        Ok(self.run_output(&mut cmd, &name)?)
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -1174,13 +1182,13 @@ impl Build {
                 (Some(stdlib), ToolFamily::Clang) => {
                     cmd.args.push(format!("-stdlib=lib{}", stdlib).into());
                 }
-                _ => {
+                _ => if self.verbose {
                     println!(
                         "cargo:warning=cpp_set_stdlib is specified, but the {:?} compiler \
                               does not support this option, ignored",
                         cmd.family
                     );
-                }
+                },
             }
         }
 
@@ -1284,7 +1292,7 @@ impl Build {
             };
             let mut out = OsString::from("/OUT:");
             out.push(dst);
-            run(
+            self.run(
                 cmd.arg(out).arg("/nologo").args(objects).args(
                     &self.objects,
                 ),
@@ -1319,7 +1327,7 @@ impl Build {
                 ));
             }
             let (mut ar, cmd) = self.get_ar()?;
-            run(
+            self.run(
                 ar.arg("crs").arg(dst).args(objects).args(&self.objects),
                 &cmd,
             )?;
@@ -1676,6 +1684,139 @@ impl Build {
             println!("{}", s);
         }
     }
+
+    fn run(&self, cmd: &mut Command, program: &str) -> Result<(), Error> {
+        if !self.verbose {
+            // Swallow and discard output.
+            self.run_output(cmd, program)?;
+            return Ok(());
+        }
+        let (mut child, print) = self.spawn(cmd, program)?;
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::ToolExecError,
+                    &format!(
+                        "Failed to wait on spawned child process, command {:?} with args {:?}.",
+                        cmd,
+                        program
+                    ),
+                ))
+            }
+        };
+        print.join().unwrap();
+        println!("{}", status);
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::ToolExecError,
+                &format!(
+                    "Command {:?} with args {:?} did not execute successfully (status code {}).",
+                    cmd,
+                    program,
+                    status
+                ),
+            ))
+        }
+    }
+
+    fn run_output(&self, cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
+        cmd.stdout(Stdio::piped());
+        let (mut child, print) = self.spawn(cmd, program)?;
+        let mut stdout = vec![];
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::ToolExecError,
+                    &format!(
+                        "Failed to wait on spawned child process, command {:?} with args {:?}.",
+                        cmd,
+                        program
+                    ),
+                ))
+            }
+        };
+        print.join().unwrap();
+        if self.verbose {
+            println!("{}", status);
+        }
+
+        if status.success() {
+            Ok(stdout)
+        } else {
+            Err(Error::new(
+                ErrorKind::ToolExecError,
+                &format!(
+                    "Command {:?} with args {:?} did not execute successfully (status code {}).",
+                    cmd,
+                    program,
+                    status
+                ),
+            ))
+        }
+    }
+
+    fn spawn(&self, cmd: &mut Command, program: &str) -> Result<(Child, JoinHandle<()>), Error> {
+        let verbose = self.verbose;
+        if verbose {
+            println!("running: {:?}", cmd);
+        }
+
+        // Capture the standard error coming from these programs, and write it out
+        // with cargo:warning= prefixes. Note that this is a bit wonky to avoid
+        // requiring the output to be UTF-8, we instead just ship bytes from one
+        // location to another.
+        match cmd.stderr(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                let stderr = BufReader::new(child.stderr.take().unwrap());
+                let print = thread::spawn(move || for line in stderr.split(b'\n').filter_map(
+                    |l| l.ok(),
+                )
+                {
+                    if verbose {
+                        print!("cargo:warning=");
+                        std::io::stdout().write_all(&line).unwrap();
+                        println!("");
+                    }
+                });
+                Ok((child, print))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+                let extra = if cfg!(windows) {
+                    " (see https://github.com/alexcrichton/cc-rs#compile-time-requirements \
+                    for help)"
+                } else {
+                    ""
+                };
+                Err(Error::new(
+                    ErrorKind::ToolNotFound,
+                    &format!(
+                        "Failed to find tool. Is `{}` installed?{}",
+                        program,
+                        extra
+                    ),
+                ))
+            }
+            Err(_) => Err(Error::new(
+                ErrorKind::ToolExecError,
+                &format!(
+                    "Command {:?} with args {:?} failed to start.",
+                    cmd,
+                    program
+                ),
+            )),
+        }
+    }
 }
 
 impl Default for Build {
@@ -1801,127 +1942,6 @@ impl Tool {
     /// Whether the tool is MSVC-like.
     pub fn is_like_msvc(&self) -> bool {
         self.family == ToolFamily::Msvc
-    }
-}
-
-fn run(cmd: &mut Command, program: &str) -> Result<(), Error> {
-    let (mut child, print) = spawn(cmd, program)?;
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(Error::new(
-                ErrorKind::ToolExecError,
-                &format!(
-                    "Failed to wait on spawned child process, command {:?} with args {:?}.",
-                    cmd,
-                    program
-                ),
-            ))
-        }
-    };
-    print.join().unwrap();
-    println!("{}", status);
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::new(
-            ErrorKind::ToolExecError,
-            &format!(
-                "Command {:?} with args {:?} did not execute successfully (status code {}).",
-                cmd,
-                program,
-                status
-            ),
-        ))
-    }
-}
-
-fn run_output(cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
-    cmd.stdout(Stdio::piped());
-    let (mut child, print) = spawn(cmd, program)?;
-    let mut stdout = vec![];
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_end(&mut stdout)
-        .unwrap();
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(Error::new(
-                ErrorKind::ToolExecError,
-                &format!(
-                    "Failed to wait on spawned child process, command {:?} with args {:?}.",
-                    cmd,
-                    program
-                ),
-            ))
-        }
-    };
-    print.join().unwrap();
-    println!("{}", status);
-
-    if status.success() {
-        Ok(stdout)
-    } else {
-        Err(Error::new(
-            ErrorKind::ToolExecError,
-            &format!(
-                "Command {:?} with args {:?} did not execute successfully (status code {}).",
-                cmd,
-                program,
-                status
-            ),
-        ))
-    }
-}
-
-fn spawn(cmd: &mut Command, program: &str) -> Result<(Child, JoinHandle<()>), Error> {
-    println!("running: {:?}", cmd);
-
-    // Capture the standard error coming from these programs, and write it out
-    // with cargo:warning= prefixes. Note that this is a bit wonky to avoid
-    // requiring the output to be UTF-8, we instead just ship bytes from one
-    // location to another.
-    match cmd.stderr(Stdio::piped()).spawn() {
-        Ok(mut child) => {
-            let stderr = BufReader::new(child.stderr.take().unwrap());
-            let print = thread::spawn(move || for line in stderr.split(b'\n').filter_map(
-                |l| l.ok(),
-            )
-            {
-                print!("cargo:warning=");
-                std::io::stdout().write_all(&line).unwrap();
-                println!("");
-            });
-            Ok((child, print))
-        }
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            let extra = if cfg!(windows) {
-                " (see https://github.com/alexcrichton/cc-rs#compile-time-requirements \
-                   for help)"
-            } else {
-                ""
-            };
-            Err(Error::new(
-                ErrorKind::ToolNotFound,
-                &format!(
-                    "Failed to find tool. Is `{}` installed?{}",
-                    program,
-                    extra
-                ),
-            ))
-        }
-        Err(_) => Err(Error::new(
-            ErrorKind::ToolExecError,
-            &format!(
-                "Command {:?} with args {:?} failed to start.",
-                cmd,
-                program
-            ),
-        )),
     }
 }
 
