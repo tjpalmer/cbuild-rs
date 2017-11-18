@@ -57,6 +57,11 @@
 #![cfg_attr(test, deny(warnings))]
 #![deny(missing_docs)]
 
+/// Export key symbols.
+pub mod prelude {
+    pub use super::{Build, BuildKind};
+}
+
 #[cfg(feature = "parallel")]
 extern crate rayon;
 
